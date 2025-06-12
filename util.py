@@ -7,7 +7,28 @@ import torch.optim as optim
 import random
 import nlpaug.augmenter.word as naw
 
+from nlpaug.model.word_embs import fasttext as ft_model
 
+from nlpaug.augmenter.word import WordEmbsAug
+from nlpaug.model.word_embs import Fasttext
+from gensim.models.fasttext import load_facebook_vectors
+
+class WordEmbsAugBinary(WordEmbsAug):
+    def __init__(self, model_path, action="substitute", aug_p=0.3):
+        # Tải FastText binary gốc của Facebook bằng cách đúng
+        model = Fasttext()
+        model.model = load_facebook_vectors(model_path)
+
+        # Khởi tạo augment dùng model đã load
+        super().__init__(
+            model_type='fasttext',
+            model_path=None,  # Tránh nlpaug gọi lại
+            model=model,
+            action=action,
+            aug_p=aug_p
+        )
+
+        
 class TwoCropTransform:
     """Create two crops of the same image"""
     def __init__(self, transform):
@@ -17,17 +38,17 @@ class TwoCropTransform:
         return [self.transform(x), self.transform(x)]
 
 class TextAugment:
-    """Create two augmented versions of the same text"""
     def __init__(self):
-        self.aug = naw.WordEmbsAug(
-            model_type='fasttext',
-            model_path='cc.de.300.bin',
+        self.aug = WordEmbsAugBinary(
+            model_path='/kaggle/input/fasttext_de/pytorch/default/1/cc.de.300.bin',
             action="substitute",
             aug_p=0.3
-        )  # Synonym replacement augmentation
+        )
 
     def __call__(self, text):
         return [self.aug.augment(text)[0], self.aug.augment(text)[0]]
+
+
     
 class AverageMeter(object):
     """Computes and stores the average and current value"""

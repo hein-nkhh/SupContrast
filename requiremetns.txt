@@ -3,3 +3,4 @@ tensorboard_logger
 tqdm
 numpy
 nlpaug
+gensim
