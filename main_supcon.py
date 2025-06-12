@@ -13,32 +13,35 @@ import tensorboard_logger as tb_logger
 from util import TextAugment, AverageMeter, adjust_learning_rate, warmup_learning_rate, set_optimizer, save_model
 from networks.xlmr_supcon import SupConXLMRLarge
 from losses import SupConLoss
+from torch.cuda.amp import autocast, GradScaler
+from sklearn.manifold import TSNE
+import matplotlib.pyplot as plt
+import numpy as np
 
 def parse_option():
     parser = argparse.ArgumentParser('argument for training')
     parser.add_argument('--print_freq', type=int, default=10, help='print frequency')
     parser.add_argument('--save_freq', type=int, default=50, help='save frequency')
-    parser.add_argument('--batch_size', type=int, default=64, help='batch_size')
-    parser.add_argument('--num_workers', type=int, default=4, help='num of workers to use')
-    parser.add_argument('--epochs', type=int, default=100, help='number of training epochs')
-    parser.add_argument('--learning_rate', type=float, default=5e-5, help='learning rate')
-    parser.add_argument('--lr_decay_epochs', type=str, default='60,80', help='where to decay lr')
+    parser.add_argument('--batch_size', type=int, default=16, help='batch_size')
+    parser.add_argument('--num_workers', type=int, default=2, help='num of workers to use')
+    parser.add_argument('--epochs', type=int, default=10, help='number of training epochs')
+    parser.add_argument('--learning_rate', type=float, default=3e-5, help='learning rate')
+    parser.add_argument('--lr_decay_epochs', type=str, default='6,8', help='where to decay lr')
     parser.add_argument('--lr_decay_rate', type=float, default=0.1, help='decay rate for learning rate')
     parser.add_argument('--weight_decay', type=float, default=1e-4, help='weight decay')
     parser.add_argument('--momentum', type=float, default=0.9, help='momentum')
     parser.add_argument('--dataset', type=str, default='path', help='dataset name or path')
     parser.add_argument('--data_folder', type=str, default=None, help='path to custom dataset')
     parser.add_argument('--method', type=str, default='SupCon', choices=['SupCon', 'SimCLR'], help='choose method')
-    parser.add_argument('--temp', type=float, default=0.07, help='temperature for loss function')
+    parser.add_argument('--temp', type=float, default=0.1, help='temperature for loss function')
     parser.add_argument('--cosine', action='store_true', help='using cosine annealing')
     parser.add_argument('--syncBN', action='store_true', help='using synchronized batch normalization')
     parser.add_argument('--warm', action='store_true', help='warm-up for large batch training')
     parser.add_argument('--trial', type=str, default='0', help='id for recording multiple runs')
-
     opt = parser.parse_args()
     opt.data_folder = './datasets/' if opt.data_folder is None else opt.data_folder
-    opt.model_path = './save/SupCon/{}_models'.format(opt.dataset)
-    opt.tb_path = './save/SupCon/{}_tensorboard'.format(opt.dataset)
+    opt.model_path = '/kaggle/working/save/SupCon/{}_models'.format(opt.dataset)
+    opt.tb_path = '/kaggle/working/save/SupCon/{}_tensorboard'.format(opt.dataset)
     iterations = opt.lr_decay_epochs.split(',')
     opt.lr_decay_epochs = [int(it) for it in iterations]
     opt.model_name = '{}_{}_lr_{}_decay_{}_bsz_{}_temp_{}_trial_{}'.format(
@@ -50,7 +53,7 @@ def parse_option():
     if opt.warm:
         opt.model_name = '{}_warm'.format(opt.model_name)
         opt.warmup_from = 1e-6
-        opt.warm_epochs = 5
+        opt.warm_epochs = 3
         if opt.cosine:
             eta_min = opt.learning_rate * (opt.lr_decay_rate ** 3)
             opt.warmup_to = eta_min + (opt.learning_rate - eta_min) * (1 + math.cos(math.pi * opt.warm_epochs / opt.epochs)) / 2
@@ -69,10 +72,8 @@ class TextDataset(Dataset):
         self.dataset = dataset
         self.transform = transform
         self.tokenizer = AutoTokenizer.from_pretrained("xlm-roberta-large")
-
     def __len__(self):
         return len(self.dataset)
-
     def __getitem__(self, idx):
         text = self.dataset[idx]['text']
         label = self.dataset[idx]['label']
@@ -113,24 +114,27 @@ def train(train_loader, model, criterion, optimizer, epoch, opt):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
+    scaler = GradScaler()
     end = time.time()
     for idx, batch in enumerate(train_loader):
         data_time.update(time.time() - end)
-        input_ids = torch.stack(batch['input_ids'], dim=1).cuda(non_blocking=True)  # [bsz, 2, seq_len]
+        input_ids = torch.stack(batch['input_ids'], dim=1).cuda(non_blocking=True)
         attention_mask = torch.stack(batch['attention_mask'], dim=1).cuda(non_blocking=True)
         labels = batch['labels'].cuda(non_blocking=True)
         bsz = labels.shape[0]
         warmup_learning_rate(opt, epoch, idx, len(train_loader), optimizer)
-        features = []
-        for i in range(2):  # Process two views
-            feat = model(input_ids[:, i], attention_mask[:, i])
-            features.append(feat)
-        features = torch.stack(features, dim=1)  # [bsz, 2, feat_dim]
-        loss = criterion(features, labels) if opt.method == 'SupCon' else criterion(features)
+        with autocast():
+            features = []
+            for i in range(2):
+                feat = model(input_ids[:, i], attention_mask[:, i])
+                features.append(feat)
+            features = torch.stack(features, dim=1)
+            loss = criterion(features, labels) if opt.method == 'SupCon' else criterion(features)
         losses.update(loss.item(), bsz)
         optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
         batch_time.update(time.time() - end)
         end = time.time()
         if (idx + 1) % opt.print_freq == 0:
@@ -142,6 +146,24 @@ def train(train_loader, model, criterion, optimizer, epoch, opt):
                    data_time=data_time, loss=losses))
             sys.stdout.flush()
     return losses.avg
+
+def visualize_tsne(model, train_loader):
+    model.eval()
+    features, labels = [], []
+    with torch.no_grad():
+        for batch in train_loader:
+            input_ids = batch['input_ids'][0].cuda()
+            attention_mask = batch['attention_mask'][0].cuda()
+            feat = model(input_ids, attention_mask).cpu().numpy()
+            features.append(feat)
+            labels.append(batch['labels'].numpy())
+    features = np.concatenate(features)
+    labels = np.concatenate(labels)
+    tsne = TSNE(n_components=2, random_state=42)
+    tsne_results = tsne.fit_transform(features)
+    plt.scatter(tsne_results[:, 0], tsne_results[:, 1], c=labels, cmap='viridis')
+    plt.savefig('/kaggle/working/tsne.png')
+    plt.close()
 
 def main():
     opt = parse_option()
@@ -162,6 +184,11 @@ def main():
             save_model(model, optimizer, opt, epoch, save_file)
     save_file = os.path.join(opt.save_folder, 'last.pth')
     save_model(model, optimizer, opt, opt.epochs, save_file)
+    
+    # Visualize t-SNE
+    print('Generating t-SNE visualization...')
+    visualize_tsne(model, train_loader)
+    print('t-SNE plot saved to /kaggle/working/tsne.png')
 
 if __name__ == '__main__':
     main()
