@@ -37,14 +37,24 @@ class TwoCropTransform:
     def __call__(self, x):
         return [self.transform(x), self.transform(x)]
 
+# class TextAugment:
+#     def __init__(self):
+#         self.aug = WordEmbsAugBinary(
+#             model_path='/kaggle/input/fasttext_de/pytorch/default/1/cc.de.300.bin',
+#             action="substitute",
+#             aug_p=0.3
+#         )
+
+#     def __call__(self, text):
+#         return [self.aug.augment(text)[0], self.aug.augment(text)[0]]
+
 class TextAugment:
     def __init__(self):
-        self.aug = WordEmbsAugBinary(
-            model_path='/kaggle/input/fasttext_de/pytorch/default/1/cc.de.300.bin',
-            action="substitute",
-            aug_p=0.3
+        self.aug = naw.BackTranslationAug(
+            from_model_name='facebook/wmt19-de-en',
+            to_model_name='facebook/wmt19-en-de',
+            device='cuda' if torch.cuda.is_available() else 'cpu'
         )
-
     def __call__(self, text):
         return [self.aug.augment(text)[0], self.aug.augment(text)[0]]
 

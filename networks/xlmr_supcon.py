@@ -4,7 +4,7 @@ from transformers import AutoModel
 
 class SupConXLMRLarge(nn.Module):
     """XLM-RoBERTa-large backbone + projection head"""
-    def __init__(self, head='mlp', feat_dim=128):
+    def __init__(self, head='mlp', feat_dim=256):
         super(SupConXLMRLarge, self).__init__()
         self.encoder = AutoModel.from_pretrained("xlm-roberta-large")
         dim_in = 1024  # XLM-RoBERTa-large embedding size
